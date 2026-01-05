@@ -21,14 +21,34 @@ DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 st.set_page_config(page_title="Personal Tracker & Analytics", layout="wide")
 db.init_db()
 
-# --- AI LOGIC ---
+# --- AZURE AUTHENTICATION ---
+def get_current_user():
+    headers = st.context.headers
+    user_email = headers.get("X-MS-CLIENT-PRINCIPAL-NAME")
+    if not user_email:
+        return "local_test_user@example.com"
+    return user_email
+
+USER_EMAIL = get_current_user()
+
+# --- AI PARSING & CATEGORIES ---
+FIXED_CATEGORIES = [
+    "Food", "Grocery", "Utilities", "Jewellery", "Bill", 
+    "Medicine", "Furniture", "Maintenance", "Transport", 
+    "Shopping", "Health", "Entertainment", "Education", "Others"
+]
+
 def parse_input_with_llm(user_input):
     today_str = date.today().strftime("%Y-%m-%d")
-    system_prompt = f"""
-    Extract data into JSON. Today is {today_str}.
-    Fields: activity, amount, entity, payment_mode, category, remark, extracted_date (YYYY-MM-DD or null).
-    Return ONLY JSON.
-    """
+    cat_list_str = ", ".join(FIXED_CATEGORIES)
+    
+    system_prompt = (
+        f"Extract data into JSON. Reference date (today) is {today_str}. "
+        f"Fields: activity, amount, entity, payment_mode, category, remark, extracted_date. "
+        f"CRITICAL: If the user mentions a specific date, use THAT for 'extracted_date'. "
+        f"Otherwise, use {today_str}. Use ONLY these categories: {cat_list_str}."
+    )
+    
     try:
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
@@ -40,113 +60,126 @@ def parse_input_with_llm(user_input):
         st.error(f"AI Error: {e}"); return None
 
 # --- UI SETUP ---
-st.title("🗒️ Personal Tracker & Analytics")
-tab1, tab2 = st.tabs(["➕ Add Entry", "📊 Dashboard & History"])
+st.sidebar.title("Account")
+st.sidebar.success(f"Logged in: {USER_EMAIL}")
+
+tab1, tab2 = st.tabs(["➕ Add Entry", "📊 Dashboard"])
 
 with tab1:
-    st.subheader("Quick Log")
-    user_input = st.text_input("Enter details", placeholder="Swiggy dinner for 500 via UPI", key="main_input")
-    
+    user_input = st.text_input("What did you spend on?", placeholder="e.g., Paid 1089.20 for Medicine from Apollo on 02 Jan 2026")
     if st.button("Analyze Input"):
         if user_input:
-            with st.spinner("Processing..."):
-                data = parse_input_with_llm(user_input)
-                if data: st.session_state['temp_data'] = data
+            data = parse_input_with_llm(user_input)
+            if data: st.session_state['temp_data'] = data
+        else: st.warning("Please enter some text.")
 
     if 'temp_data' in st.session_state:
         data = st.session_state['temp_data']
-        ai_date_str = data.get('extracted_date')
-        initial_date = datetime.strptime(ai_date_str, "%Y-%m-%d").date() if ai_date_str else date.today()
-
         with st.form("confirm_form", clear_on_submit=True):
-            log_date = st.date_input("Date", value=initial_date)
-            c1, c2 = st.columns(2)
-            with c1:
-                activity = st.text_input("Activity", data.get('activity'))
-                amount = st.number_input("Amount", value=float(data.get('amount', 0)))
-                entity = st.text_input("Entity", data.get('entity'))
-            with c2:
-                mode = st.text_input("Mode of Payment", data.get('payment_mode'))
-                category = st.text_input("Category", data.get('category'))
-                remark = st.text_area("Remark", data.get('remark'))
+            # AI-extracted date handling
+            try:
+                default_date = pd.to_datetime(data.get('extracted_date')).date()
+            except:
+                default_date = date.today()
+
+            log_date = st.date_input("Date", value=default_date)
+            activity = st.text_input("Activity", data.get('activity'))
+            amount = st.number_input("Amount", value=float(data.get('amount', 0)))
+            entity = st.text_input("Entity", data.get('entity'))
+            mode = st.text_input("Payment Mode", data.get('payment_mode'))
+            
+            suggested_cat = data.get('category', 'Others')
+            cat_idx = FIXED_CATEGORIES.index(suggested_cat) if suggested_cat in FIXED_CATEGORIES else FIXED_CATEGORIES.index("Others")
+            category = st.selectbox("Category", FIXED_CATEGORIES, index=cat_idx)
+            
+            remark = st.text_area("Remark", data.get('remark'))
             
             if st.form_submit_button("Save Entry"):
-                db.save_entry(str(log_date), activity, amount, entity, mode, category, remark)
-                st.success("✅ Saved!"); del st.session_state['temp_data']; st.rerun()
+                db.save_entry(USER_EMAIL, log_date, activity, amount, entity, mode, category, remark)
+                st.success("✅ Saved!")
+                del st.session_state['temp_data']
+                st.rerun()
 
 with tab2:
-    df = db.fetch_all_logs()
+    df = db.fetch_user_logs(USER_EMAIL)
+    
     if not df.empty:
-        # Pre-process Analytics
         df['log_date'] = pd.to_datetime(df['log_date'])
-        df['Month'] = df['log_date'].dt.strftime('%b %Y')
+        df['MonthYear'] = df['log_date'].dt.strftime('%B %Y')
         
-        # --- FILTERS & METRICS ---
-        st.subheader("📅 Monthly Analytics")
-        available_months = sorted(df['Month'].unique(), 
-                                 key=lambda x: datetime.strptime(x, '%b %Y'), 
-                                 reverse=True)
-        selected_month = st.selectbox("Filter by Month", ["All Time"] + available_months)
+        # --- 1. FILTERING ---
+        st.subheader("📊 Analytics & History")
+        month_options = ["All Time"] + sorted(df['MonthYear'].unique().tolist(), reverse=True)
+        selected_month = st.selectbox("Filter by Month", month_options)
         
-        filtered_df = df if selected_month == "All Time" else df[df['Month'] == selected_month]
+        # Determine the target month for budget calculations
+        if selected_month == "All Time":
+            target_month_str = datetime.now().strftime('%B %Y')
+            display_df = df
+        else:
+            target_month_str = selected_month
+            display_df = df[df['MonthYear'] == selected_month]
+
+        # --- 2. DYNAMIC BUDGET PROGRESS ---
+        with st.expander("🎯 Monthly Budget Settings"):
+            budget_goal = st.number_input("Monthly Limit (₹):", value=50000, step=1000)
         
-        # Clean Date Formatting for Display (Removes 00:00:00)
-        display_df = filtered_df.copy()
-        display_df['log_date'] = display_df['log_date'].dt.date
+        # Progress is calculated based on the selected (or current) month
+        budget_df = df[df['MonthYear'] == target_month_str]
+        this_period_total = budget_df['amount'].sum()
+        progress = min(this_period_total / budget_goal, 1.0)
         
+        st.write(f"**Spend for {target_month_str}: ₹{this_period_total:,.2f} / ₹{budget_goal:,.2f}**")
+        st.progress(progress)
+        if this_period_total > budget_goal: st.error(f"⚠️ Budget for {target_month_str} Exceeded!")
+
+        # --- 3. METRICS ---
+        st.divider()
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Expense", f"₹{filtered_df['amount'].sum():,.2f}")
-        m2.metric("Average Spending", f"₹{filtered_df['amount'].mean():,.2f}")
-        m3.metric("Logs Count", len(filtered_df))
+        m1.metric(f"Total ({selected_month})", f"₹{display_df['amount'].sum():,.2f}")
+        m2.metric(f"Avg Spend ({selected_month})", f"₹{display_df['amount'].mean():,.2f}")
+        m3.metric("Records", len(display_df))
 
-        # --- CHARTS & TOP 5 ---
-        st.divider()
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            st.write("#### Category Breakdown")
-            cat_data = filtered_df.groupby('category')['amount'].sum().reset_index()
-            st.bar_chart(data=cat_data, x='category', y='amount', color='#ff4b4b')
-            
-        with col_c2:
-            st.write("#### Top 5 Most Expensive Items")
-            # Cleaning date and using dataframe for better ID rendering
-            top_5 = display_df.nlargest(5, 'amount')[['activity', 'entity', 'amount', 'log_date']]
-            st.dataframe(top_5, width='stretch', hide_index=True)
+        # --- 4. CHARTS & TOP 5 ---
+        st.write("#### 📈 Spending Trends")
+        df_trend = df.groupby(df['log_date'].dt.to_period('M').astype(str))['amount'].sum().reset_index()
+        st.line_chart(df_trend.set_index('log_date'))
 
-        st.divider()
-        st.write("#### Spending Trend (Monthly)")
-        trend_df = df.groupby('Month')['amount'].sum().reset_index()
-        trend_df['Sort_Key'] = trend_df['Month'].apply(lambda x: datetime.strptime(x, '%b %Y'))
-        trend_df = trend_df.sort_values('Sort_Key')
-        st.bar_chart(data=trend_df, x='Month', y='amount', color='#29b5e8')
+        # Clean display copy for UI elements
+        ui_df = display_df.copy()
+        ui_df['log_date'] = ui_df['log_date'].dt.date
 
-        # --- RECORDS & MANAGEMENT ---
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("#### 📊 By Category")
+            cat_plot = ui_df.groupby('category')['amount'].sum().reset_index()
+            st.bar_chart(cat_plot.set_index('category'))
+        with c2:
+            st.write("#### 🏆 Top 5 Expenses")
+            top_5 = ui_df.nlargest(5, 'amount')[['log_date', 'activity', 'entity', 'amount']]
+            st.dataframe(top_5, hide_index=True, width='stretch')
+
+        # --- 5. DETAILED TABLE & EDIT ---
         st.divider()
-        st.subheader("📂 Manage Records")
-        # hide_index=True fixes the issue with ID 11 wrapping to two lines
-        st.dataframe(display_df.sort_values('log_date', ascending=False).drop(columns=['Month']), 
-                     use_container_width=True, hide_index=True)
-        
-        with st.expander("Edit or Delete Entry"):
-            edit_id = st.selectbox("Select ID to Modify", filtered_df['id'].tolist())
-            row = filtered_df[filtered_df['id'] == edit_id].iloc[0]
-            
-            ce1, ce2 = st.columns(2)
-            with ce1:
-                u_act = st.text_input("Update Activity", row['activity'])
-                u_amt = st.number_input("Update Amount", value=float(row['amount']))
-                u_cat = st.text_input("Update Category", row['category'])
-            with ce2:
-                u_ent = st.text_input("Update Entity", row['entity'])
-                u_mod = st.text_input("Update Payment Mode", row['payment_mode'])
-                u_rem = st.text_input("Update Remark", row['remark'])
-            
-            b1, b2 = st.columns(2)
-            if b1.button("Apply Changes", type="primary"):
-                db.update_entry(u_act, u_amt, u_cat, u_ent, u_mod, u_rem, edit_id)
-                st.rerun()
-            if b2.button("🗑️ Delete Record"):
-                db.delete_entry(edit_id)
-                st.rerun()
+        st.write(f"#### 📄 Detailed Records: {selected_month}")
+        st.dataframe(ui_df.drop(columns=['user_email', 'MonthYear']), width='stretch', hide_index=True)
+
+        with st.expander("📝 Edit or Delete Records"):
+            edit_id = st.selectbox("Select ID", ui_df['id'].tolist())
+            curr = ui_df[ui_df['id'] == edit_id].iloc[0]
+            with st.form(f"edit_{edit_id}"):
+                e_date = st.date_input("Date", value=curr['log_date'])
+                e_act = st.text_input("Activity", curr['activity'])
+                e_amt = st.number_input("Amount", value=float(curr['amount']))
+                e_cat = st.selectbox("Category", FIXED_CATEGORIES, index=FIXED_CATEGORIES.index(curr['category']) if curr['category'] in FIXED_CATEGORIES else 0)
+                e_ent = st.text_input("Entity", curr['entity'])
+                e_mod = st.text_input("Mode", curr['payment_mode'])
+                e_rem = st.text_area("Remark", curr['remark'])
+                if st.form_submit_button("Update"):
+                    db.update_entry(e_date, e_act, e_amt, e_cat, e_ent, e_mod, e_rem, edit_id, USER_EMAIL)
+                    st.rerun()
+                if st.form_submit_button("Delete Record", type="primary"):
+                    db.delete_entry(edit_id, USER_EMAIL)
+                    st.rerun()
     else:
-        st.info("No logs found. Add an entry to get started!")
+        st.info("No records found. Start adding entries in the first tab!")

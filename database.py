@@ -9,39 +9,48 @@ def get_connection():
 def init_db():
     conn = get_connection()
     c = conn.cursor()
+    # 1. Create table if it doesn't exist
     c.execute('''CREATE TABLE IF NOT EXISTS logs 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  user_email TEXT,
                   log_date TEXT, activity TEXT, amount REAL, 
                   entity TEXT, payment_mode TEXT, category TEXT, remark TEXT)''')
+    
+    # 2. SELF-HEALING: Check if 'user_email' column exists in case of old DB file
+    c.execute("PRAGMA table_info(logs)")
+    columns = [column[1] for column in c.fetchall()]
+    if 'user_email' not in columns:
+        print("Migrating database: Adding user_email column...")
+        c.execute("ALTER TABLE logs ADD COLUMN user_email TEXT DEFAULT 'local_test_user@example.com'")
+    
     conn.commit()
     conn.close()
 
-def save_entry(log_date, activity, amount, entity, mode, category, remark):
+def save_entry(user_email, log_date, activity, amount, entity, mode, category, remark):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("""INSERT INTO logs (log_date, activity, amount, entity, payment_mode, category, remark) 
-                 VALUES (?,?,?,?,?,?,?)""", (log_date, activity, amount, entity, mode, category, remark))
+    c.execute("""INSERT INTO logs (user_email, log_date, activity, amount, entity, payment_mode, category, remark) 
+                 VALUES (?,?,?,?,?,?,?,?)""", (user_email, str(log_date), activity, amount, entity, mode, category, remark))
     conn.commit()
     conn.close()
 
-def fetch_all_logs():
+def fetch_user_logs(user_email):
     conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM logs", conn)
+    df = pd.read_sql_query("SELECT * FROM logs WHERE user_email = ?", conn, params=(user_email,))
     conn.close()
     return df
 
-def update_entry(u_act, u_amt, u_cat, u_ent, u_mod, u_rem, edit_id):
+def update_entry(u_act, u_amt, u_cat, u_ent, u_mod, u_rem, edit_id, user_email):
     conn = get_connection()
     c = conn.cursor()
-    # Updated to ensure Activity, Amount, Category, Entity, Mode, and Remark are all saved
     c.execute("""UPDATE logs SET activity=?, amount=?, category=?, entity=?, payment_mode=?, remark=? 
-                 WHERE id=?""", (u_act, u_amt, u_cat, u_ent, u_mod, u_rem, edit_id))
+                 WHERE id=? AND user_email=?""", (u_act, u_amt, u_cat, u_ent, u_mod, u_rem, edit_id, user_email))
     conn.commit()
     conn.close()
 
-def delete_entry(entry_id):
+def delete_entry(entry_id, user_email):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM logs WHERE id=?", (entry_id,))
+    c.execute("DELETE FROM logs WHERE id=? AND user_email=?", (entry_id, user_email))
     conn.commit()
     conn.close()
